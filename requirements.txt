@@ -1,0 +1,9 @@
+python-dotenv
+langchain-core
+langchain-google-genai
+langchain-postgres
+langgraph
+google-generativeai
+psycopg2-binary
+pandas
+pydantic

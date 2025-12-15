@@ -11,7 +11,7 @@ import json
 # Adjust imports to be relative to the 'src' directory
 from agents.langgraph_agent import SQLLangGraphAgentGemini
 from db.vector_db_store import store_in_vector_db, get_vector_store
-from db.query_runnerV2 import RedshiftSQLTool
+from db.query_runner import RedshiftSQLTool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
