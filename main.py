@@ -1,61 +1,103 @@
 import os
 import sys
+import logging
+import json
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
+
+# Add parent directory to path to maintain your import structure
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fastapi import FastAPI, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 import google.generativeai as genai
-import asyncio
-import json
 
-# Adjust imports to be relative to the 'src' directory
-from agents.langgraph_agent import SQLLangGraphAgentGemini
-from db.vector_db_store import store_in_vector_db, get_vector_store
-from db.query_runner import RedshiftSQLTool
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
+# Relative imports from your project structure
+try:
+    from agents.langgraph_agent import SQLLangGraphAgentGemini
+    from db.vector_db_store import get_vector_store
+    from db.query_runnerV2 import RedshiftSQLTool
+    from db.table_descriptions_semantic import join_details, schema_info
+except ImportError as e:
+    print(f"Critical Import Error: {e}")
+    print("Ensure you are running this from the correct directory so relative imports work.")
+    sys.exit(1)
 
-# Import schema and document information
-from db.table_descriptions_semantic import documents, join_details, schema_info
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
+# Load Environment
 load_dotenv()
-
-# Configuration
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GOOGLE_API_KEY)
+if not GOOGLE_API_KEY:
+    logger.error("GOOGLE_API_KEY not found in environment variables")
+else:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
+# --- Pydantic Models ---
 
-class Chatbot:
+class ChatRequest(BaseModel):
+    question: str = Field(..., description="The user's natural language query")
+    thread_id: str = Field(default="default", description="Session ID for conversation history")
+
+class ChartConfig(BaseModel):
+    type: str
+    title: str
+    x_axis: Optional[str] = None
+    y_axis: Optional[str] = None
+    reason: Optional[str] = None
+
+class ChartAnalysis(BaseModel):
+    chartable: bool
+    reasoning: Optional[str] = None
+    auto_chart: Optional[ChartConfig] = None
+    suggested_charts: Optional[List[Dict[str, Any]]] = None
+
+class ChatResponse(BaseModel):
+    sql_query: Optional[str] = None
+    data: Optional[List[Dict[str, Any]]] = None
+    chart_analysis: Optional[ChartAnalysis] = None
+    error: Optional[str] = None
+    record_count: int = 0
+
+# --- Chatbot Service Logic ---
+
+class ChatbotService:
     def __init__(self):
-        
-        # Initialize agent components once for efficiency
         self.vector_store = None
         self.query_runner = None
         self.gemini_agent = None
         self._init_agent_components()
     
     def _init_agent_components(self):
-        """Initialize agent components once during chatbot creation"""
-        print("Initializing Gemini SQL Agent components...")
+        """Initialize agent components once during startup"""
+        logger.info("Initializing Gemini SQL Agent components...")
         
         # Load existing vector store
         try:
             self.vector_store = get_vector_store()
             if self.vector_store:
-                print("✓ Existing vector store loaded successfully.")
+                logger.info("✓ Existing vector store loaded successfully.")
             else:
-                print("⚠ Warning: No existing vector store found.")
+                logger.warning("⚠ Warning: No existing vector store found.")
         except Exception as e:
-            print(f"✗ Error loading existing vector store: {e}")
+            logger.error(f"✗ Error loading vector store: {e}")
             self.vector_store = None
         
         # Initialize Query Runner
         try:
             self.query_runner = RedshiftSQLTool()
-            print("✓ Redshift query runner initialized.")
+            logger.info("✓ Redshift query runner initialized.")
         except Exception as e:
-            print(f"⚠ Could not initialize Redshift query runner: {e}")
+            logger.error(f"⚠ Could not initialize Redshift query runner: {e}")
             self.query_runner = None
         
         # Initialize the Gemini Agent
@@ -67,245 +109,123 @@ class Chatbot:
                     schema_info=schema_info,
                     query_runner=self.query_runner
                 )
-                print("✓ Gemini SQL LangGraph Agent initialized successfully.\n")
+                logger.info("✓ Gemini SQL LangGraph Agent initialized successfully.")
             except Exception as e:
-                print(f"✗ Error initializing Gemini agent: {e}")
+                logger.error(f"✗ Error initializing Gemini agent: {e}")
                 self.gemini_agent = None
         else:
-            print("✗ Cannot initialize agent without vector store.")
+            logger.error("✗ Cannot initialize agent without vector store.")
             self.gemini_agent = None
 
-    async def get_existing_vector_store(self):
-        """
-        Load the existing vector store collection without creating embeddings or re-embedding documents.
-        Returns None if the collection does not exist.
-        """
-        if self.vector_store:
-            return self.vector_store
+    async def get_response(self, user_question: str, thread_id: str = "default") -> Dict[str, Any]:
+        """Processes the user's question"""
         
-        try:
-            vector_store = get_vector_store()
-            if vector_store:
-                print("Existing vector store loaded successfully.")
-                self.vector_store = vector_store
-            else:
-                print("No existing vector store found.")
-            return vector_store
-        except Exception as e:
-            print(f"Error loading existing vector store: {e}")
-            return None
-
-    async def get_response(self, user_question: str, thread_id: str = "default"):
-        """
-        Processes the user's question as a database query with chart analysis.
-        
-        Args:
-            user_question: The user's question
-            thread_id: Unique identifier for the conversation thread
-        
-        Returns:
-            dict: Contains SQL query, JSON data, and chart analysis
-        """
-        print(f"\n{'='*60}")
-        print(f"Processing query for thread: {thread_id}")
-        print(f"{'='*60}")
-        
-        # Check if agent is initialized
         if not self.gemini_agent:
-            return {"error": "SQL Agent not initialized. Please check if vector store exists."}
+            return {"error": "SQL Agent not initialized. Server error or missing vector store."}
         
         if not self.vector_store:
-            return {"error": "No existing vector store found. Please create the vector store first."}
+            return {"error": "No existing vector store found."}
 
-        print(f"\n📝 User Question: '{user_question}'")
+        logger.info(f"Processing query for thread: {thread_id} | Q: {user_question}")
 
         try:
-            # Process the user question with thread_id
+            # Process the user question
             result = self.gemini_agent.process_query(user_question, thread_id=thread_id)
-
-            # Display results
-            self._display_results(result)
-            
             return result
-
         except Exception as e:
-            print(f"\n✗ Error occurred during query processing: {e}")
-            return {"error": f"An error occurred during query processing: {e}"}
-    
-    def _display_results(self, result: dict):
-        """Display formatted results with chart analysis"""
-        print(f"\n{'='*60}")
-        print("QUERY RESULTS")
-        print(f"{'='*60}")
-        
-        if not result.get('success'):
-            print(f"\n✗ Error: {result.get('error')}")
-            return
-        
-        # Display SQL Query
-        print(f"\n📊 SQL Query Generated:")
-        print("-" * 60)
-        print(result.get('cleaned_sql_query', 'N/A'))
-        print("-" * 60)
-        
-        # Display JSON Data
-        print(f"\n📦 Data (JSON Format):")
-        print("-" * 60)
-        json_data = result.get('execution_data_json', '{}')
-        try:
-            # Pretty print JSON
-            parsed_json = json.loads(json_data)
-            print(json.dumps(parsed_json, indent=2))
-            
-            # Show record count
-            if isinstance(parsed_json, list):
-                print(f"\n📈 Total Records: {len(parsed_json)}")
-        except json.JSONDecodeError:
-            print(json_data)
-        print("-" * 60)
-        
-        # Display Chart Analysis
-        chart_analysis = result.get('chart_analysis', {})
-        if chart_analysis:
-            print(f"\n📊 Chart Analysis:")
-            print("-" * 60)
-            print(f"Chartable: {'✓ Yes' if chart_analysis.get('chartable') else '✗ No'}")
-            print(f"Reasoning: {chart_analysis.get('reasoning', 'N/A')}")
-            
-            if chart_analysis.get('chartable'):
-                # Display recommended chart
-                auto_chart = chart_analysis.get('auto_chart', {})
-                print(f"\n🎯 Recommended Chart:")
-                print(f"  Type: {auto_chart.get('type', 'N/A')}")
-                print(f"  Title: {auto_chart.get('title', 'N/A')}")
-                print(f"  X-axis: {auto_chart.get('x_axis', 'N/A')}")
-                print(f"  Y-axis: {auto_chart.get('y_axis', 'N/A')}")
-                print(f"  Reason: {auto_chart.get('reason', 'N/A')}")
-                
-                # Display alternative suggestions
-                suggested_charts = chart_analysis.get('suggested_charts', [])
-                if suggested_charts:
-                    print(f"\n💡 Alternative Chart Options:")
-                    for idx, chart in enumerate(suggested_charts, 1):
-                        print(f"  {idx}. {chart.get('type', 'N/A')} - {chart.get('title', 'N/A')}")
-                        print(f"     Confidence: {chart.get('confidence', 'N/A')}")
-            print("-" * 60)
-        
-        print(f"\n{'='*60}\n")
-    
-    def reinitialize_agent(self):
-        """Reinitialize the agent (useful if vector store is updated)"""
-        print("Reinitializing agent components...")
-        self._init_agent_components()
-    
-    def get_agent_status(self):
-        """Get the initialization status of agent components"""
-        return {
-            "vector_store_loaded": self.vector_store is not None,
-            "query_runner_loaded": self.query_runner is not None,
-            "agent_initialized": self.gemini_agent is not None
-        }
+            logger.exception("Error occurred during query processing")
+            return {"error": str(e)}
 
+# --- FastAPI App Setup ---
 
-# Main function
-async def main():
-    """Main function to run the chatbot"""
-    print("\n" + "="*60)
-    print("SQL CHATBOT WITH VISUALIZATION ANALYSIS")
-    print("="*60 + "\n")
-    
-    # Initialize chatbot
-    chatbot = Chatbot()
-    
-    # Check agent status
-    status = chatbot.get_agent_status()
-    if not status['agent_initialized']:
-        print("✗ Failed to initialize chatbot. Exiting...")
-        return
-    
-    # Demo mode: Single query
-    if len(sys.argv) > 1 and sys.argv[1] == "--demo":
-        demo_questions = [
-            "How many loans were onboarded in the last 3 months?",
-            "Show me the top 10 borrowers by total loan amount",
-            "What is the distribution of loans by status?"
-        ]
-        
-        print("Running in DEMO mode with sample questions...\n")
-        for idx, question in enumerate(demo_questions, 1):
-            print(f"\n{'#'*60}")
-            print(f"DEMO QUERY {idx}/{len(demo_questions)}")
-            print(f"{'#'*60}")
-            await chatbot.get_response(question, thread_id=f"demo_thread_{idx}")
-            
-            if idx < len(demo_questions):
-                await asyncio.sleep(2)  # Pause between queries
-        
-        print("\n✓ Demo completed!")
-        return
-    
-    # Interactive mode
-    print("Starting in INTERACTIVE mode...")
-    print("Commands:")
-    print("  - Type your question to query the database")
-    print("  - Type 'status' to check agent status")
-    print("  - Type 'exit' or 'quit' to end the session")
-    print("  - Type 'new' to start a new conversation thread\n")
-    
-    thread_id = "default"
-    conversation_count = 0
-    
-    while True:
-        try:
-            user_input = input("\n🤔 You: ").strip()
-            
-            if not user_input:
-                continue
-            
-            # Handle commands
-            if user_input.lower() in ['exit', 'quit']:
-                print("\n👋 Goodbye! Thank you for using the SQL Chatbot.")
-                break
-            
-            elif user_input.lower() == 'status':
-                status = chatbot.get_agent_status()
-                print("\n📊 Agent Status:")
-                print(f"  Vector Store: {'✓ Loaded' if status['vector_store_loaded'] else '✗ Not Loaded'}")
-                print(f"  Query Runner: {'✓ Loaded' if status['query_runner_loaded'] else '✗ Not Loaded'}")
-                print(f"  Agent: {'✓ Initialized' if status['agent_initialized'] else '✗ Not Initialized'}")
-                continue
-            
-            elif user_input.lower() == 'new':
-                conversation_count += 1
-                thread_id = f"thread_{conversation_count}"
-                print(f"\n🔄 Started new conversation thread: {thread_id}")
-                continue
-            
-            # Process query
-            result = await chatbot.get_response(user_input, thread_id=thread_id)
-            
-            # Optionally save results to file
-            if result.get('success') and result.get('chart_analysis', {}).get('chartable'):
-                save_option = input("\n💾 Save results to file? (y/n): ").strip().lower()
-                if save_option == 'y':
-                    filename = f"query_result_{thread_id}_{asyncio.get_event_loop().time():.0f}.json"
-                    with open(filename, 'w') as f:
-                        json.dump({
-                            'question': user_input,
-                            'sql_query': result.get('cleaned_sql_query'),
-                            'data': json.loads(result.get('execution_data_json', '{}')),
-                            'chart_analysis': result.get('chart_analysis')
-                        }, f, indent=2)
-                    print(f"✓ Results saved to: {filename}")
-        
-        except KeyboardInterrupt:
-            print("\n\n👋 Interrupted. Exiting...")
-            break
-        except Exception as e:
-            print(f"\n✗ Unexpected error: {e}")
-            continue
+# Global instance placeholder
+chatbot_service: Optional[ChatbotService] = None
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize the Chatbot Service
+    global chatbot_service
+    chatbot_service = ChatbotService()
+    yield
+    # Shutdown: Clean up if necessary (e.g., close DB connections)
+    logger.info("Shutting down SQL Chatbot API")
+
+app = FastAPI(
+    title="SQL RAG Chatbot API",
+    description="API for converting natural language to Redshift SQL queries with visualization suggestions.",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS Configuration (Adjust origins for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Endpoints ---
+
+@app.get("/health")
+async def health_check():
+    """Check the health of the agent components"""
+    if not chatbot_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    
+    status_report = {
+        "vector_store": chatbot_service.vector_store is not None,
+        "query_runner": chatbot_service.query_runner is not None,
+        "agent_ready": chatbot_service.gemini_agent is not None
+    }
+    
+    if not status_report["agent_ready"]:
+        return JSONResponse(status_code=503, content=status_report)
+        
+    return status_report
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """
+    Main chat endpoint.
+    Receives a natural language question and returns SQL data + chart config.
+    """
+    if not chatbot_service or not chatbot_service.gemini_agent:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, 
+            detail="Chatbot agent is not fully initialized. Check server logs."
+        )
+
+    # Get raw response from agent
+    raw_result = await chatbot_service.get_response(request.question, request.thread_id)
+    
+    # Handle Errors from the agent
+    if raw_result.get("error") or not raw_result.get("success", True):
+        return ChatResponse(
+            error=raw_result.get("error", "Unknown error occurred processing query")
+        )
+
+    # Parse JSON data string to Python Object
+    data_content = []
+    execution_data_str = raw_result.get("execution_data_json", "[]")
+    try:
+        data_content = json.loads(execution_data_str)
+    except json.JSONDecodeError:
+        logger.warning("Failed to parse execution_data_json")
+        data_content = []
+
+    # Map raw result to Pydantic Response
+    response = ChatResponse(
+        sql_query=raw_result.get("cleaned_sql_query"),
+        data=data_content,
+        record_count=len(data_content) if isinstance(data_content, list) else 0,
+        chart_analysis=raw_result.get("chart_analysis")
+    )
+    
+    return response
 
 if __name__ == "__main__":
-    # Run the async main function
-    asyncio.run(main())
+    import uvicorn
+    # Run with: python api.py
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
