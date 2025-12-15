@@ -240,6 +240,7 @@ class SQLLangGraphAgentGemini:
             if raw_query is None:
                 raise ValueError("SQL Generator returned None")
 
+            print(f"Generated SQL Query: {raw_query}")
             return {
                 "raw_sql_query": raw_query,
                 "current_step": "sql_generation_complete",
@@ -301,25 +302,35 @@ class SQLLangGraphAgentGemini:
             result = self.query_runner.run(state["cleaned_sql_query"])
             
             execution_data_json = ""
+            execution_result = ""
             
             if result is not None:
                 try:
-                    # Handle Pandas DataFrame
-                    if hasattr(result, 'to_json'):
-                        execution_data_json = result.to_json(orient='records', date_format='iso')
-                    # Handle list of dicts or raw dict
-                    elif isinstance(result, (list, dict)):
+                    # Handle Pandas DataFrame (expected from query_runner)
+                    if hasattr(result, 'to_dict'):
+                        records = result.to_dict(orient='records')
+                        execution_data_json = json.dumps(records, default=str)
+                        execution_result = f"Query returned {len(result)} rows"
+                    # Handle list of dicts
+                    elif isinstance(result, list):
                         execution_data_json = json.dumps(result, default=str)
+                        execution_result = f"Query returned {len(result)} rows"
+                    # Handle single dict
+                    elif isinstance(result, dict):
+                        execution_data_json = json.dumps([result], default=str)
+                        execution_result = "Query returned 1 row"
                     else:
-                        execution_data_json = json.dumps({"result": str(result)}, default=str)
+                        raise ValueError("Query runner must return DataFrame, list[dict], or dict")
                 except Exception as json_error:
                     logger.error(f"JSON conversion error: {json_error}")
                     execution_data_json = json.dumps({"error": f"Could not convert to JSON: {str(json_error)}"})
+                    execution_result = f"Error: {str(json_error)}"
             else:
-                execution_data_json = json.dumps({"result": "No data returned"})
+                execution_data_json = json.dumps([])
+                execution_result = "No data returned"
             
             return {
-                "execution_result": str(result),
+                "execution_result": execution_result,
                 "execution_data_json": execution_data_json,
                 "current_step": "execution_complete",
                 "is_complete": False, # Continue to chart analysis
@@ -339,15 +350,22 @@ class SQLLangGraphAgentGemini:
             data_result = state.get("execution_data_json", "")
             question = state.get("user_question", "")
             
-            if not data_result or data_result == json.dumps({"result": "No data returned"}):
+            # Validate JSON structure
+            try:
+                parsed_data = json.loads(data_result)
+            except Exception:
+                parsed_data = []
+            
+            # Check if data is structured and non-empty
+            if not isinstance(parsed_data, list) or len(parsed_data) == 0:
                 return {
                     "chart_analysis": {
                         "chartable": False,
-                        "reasoning": "No data available for visualization",
+                        "reasoning": "Result is not structured tabular data or is empty",
                         "suggested_charts": [],
-                        "auto_chart": {"type": "", "title": "", "reason": "No data"}
+                        "auto_chart": {"type": "", "title": "", "reason": "No valid data"}
                     },
-                    "messages": [AIMessage(content=f"Query executed successfully.\n\nSQL Query:\n``````\n\nResult: No data returned.")],
+                    "messages": [AIMessage(content=f"Query executed successfully.\n\nResult: No data returned.")],
                     "current_step": "chart_analysis_complete",
                     "is_complete": True
                 }
@@ -357,38 +375,37 @@ class SQLLangGraphAgentGemini:
             
             chart_analysis_prompt = f"""You are a data visualization expert. Analyze if this data can be visualized.
 
-User Question: {question}
-Data Sample: {data_sample}
+User Question:
+{question}
 
-RESPONSE FORMAT (JSON ONLY):
-{{
-    "chartable": true,
-    "reasoning": "Explanation",
-    "suggested_charts": [
-        {{
-            "type": "bar/line/pie/scatter/area/histogram",
-            "title": "Chart Title",
-            "x_axis": "field_name",
-            "y_axis": "field_name", 
-            "reason": "Why this fits",
-            "confidence": 0.8
-        }}
-    ],
-    "auto_chart": {{
-        "type": "best_chart_type",
-        "title": "Best Chart Title",
-        "x_axis": "field_name",
-        "y_axis": "field_name",
-        "reason": "Why this is best"
-    }}
-}}"""
+Data Sample:
+{data_sample}
 
-            analysis_prompt_template = ChatPromptTemplate.from_messages([
-                ("user", chart_analysis_prompt)
-            ])
-            
-            analysis_chain = analysis_prompt_template | self.llm
-            chart_response_message = analysis_chain.invoke({})
+Respond with ONLY valid JSON in this exact structure (no markdown, no code blocks):
+{{{{
+  "chartable": true,
+  "reasoning": "Explanation",
+  "suggested_charts": [
+    {{{{
+      "type": "bar",
+      "title": "Chart Title",
+      "x_axis": "column_name",
+      "y_axis": "column_name",
+      "reason": "Why this fits",
+      "confidence": 0.85
+    }}}}
+  ],
+  "auto_chart": {{{{
+    "type": "bar",
+    "title": "Best Chart",
+    "x_axis": "column_name",
+    "y_axis": "column_name",
+    "reason": "Why best"
+  }}}}
+}}}}"""
+
+            # Invoke LLM directly without ChatPromptTemplate
+            chart_response_message = self.llm.invoke([HumanMessage(content=chart_analysis_prompt)])
             chart_response = chart_response_message.content.strip().replace('``````', '')
             
             try:
