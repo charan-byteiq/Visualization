@@ -1,0 +1,52 @@
+{
+  "question": "Show total funded amount vs considered funded amount for each loan product ID.",
+  "sql_query": "SELECT\n    loanproductid,\n    SUM(fundedamount) AS TotalFundedAmount,\n    SUM(consideredfundedamount) AS TotalConsideredFundedAmount\nFROM\n    fl_lms.loan_filters\nGROUP BY\n    loanproductid\nORDER BY\n    loanproductid;",
+  "data": [
+    {
+      "loanproductid": "ACHAdvance",
+      "totalfundedamount": 24898095.826389,
+      "totalconsideredfundedamount": 31254401.197276
+    },
+    {
+      "loanproductid": "MCABankCard",
+      "totalfundedamount": 867963.1,
+      "totalconsideredfundedamount": 951857.2783
+    },
+    {
+      "loanproductid": "MCABankCardMigration",
+      "totalfundedamount": 264186239.02,
+      "totalconsideredfundedamount": 327531082.67
+    },
+    {
+      "loanproductid": "MCAFixedACH",
+      "totalfundedamount": 170790939.237904,
+      "totalconsideredfundedamount": 220029103.082111
+    },
+    {
+      "loanproductid": "MCAMigrationACH",
+      "totalfundedamount": 247708340.11,
+      "totalconsideredfundedamount": 303833728.14
+    }
+  ],
+  "chart_analysis": {
+    "chartable": true,
+    "reasoning": "The user wants to compare two numerical values ('totalfundedamount' and 'totalconsideredfundedamount') across different categorical entities ('loanproductid'). This type of data is perfectly suited for visualization, allowing for direct comparison of the two amounts for each loan product.",
+    "suggested_charts": [
+      {
+        "type": "bar",
+        "title": "Total Funded vs. Considered Funded Amount per Loan Product ID",
+        "x_axis": "loanproductid",
+        "y_axis": "totalfundedamount",
+        "reason": "A grouped bar chart is ideal for directly comparing 'totalfundedamount' and 'totalconsideredfundedamount' for each 'loanproductid'. 'loanproductid' would be on the x-axis, and two bars (one for 'totalfundedamount' and one for 'totalconsideredfundedamount') would be grouped for each product on the y-axis, allowing for easy visual comparison of the two metrics.",
+        "confidence": 0.95
+      }
+    ],
+    "auto_chart": {
+      "type": "bar",
+      "title": "Total Funded vs. Considered Funded Amount per Loan Product ID",
+      "x_axis": "loanproductid",
+      "y_axis": "totalfundedamount",
+      "reason": "A grouped bar chart provides a clear and intuitive way to compare 'totalfundedamount' and 'totalconsideredfundedamount' side-by-side for each 'loanproductid'. 'loanproductid' will serve as the category axis, and two distinct bars will represent 'totalfundedamount' and 'totalconsideredfundedamount' for each category on the value axis."
+    }
+  }
+}
