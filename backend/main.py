@@ -20,7 +20,7 @@ import google.generativeai as genai
 try:
     from agents.langgraph_agent import SQLLangGraphAgentGemini
     from db.vector_db_store import get_vector_store
-    from db.query_runnerV2 import RedshiftSQLTool
+    from db.query_runner import RedshiftSQLTool
     from db.table_descriptions_semantic import join_details, schema_info
 except ImportError as e:
     print(f"Critical Import Error: {e}")
@@ -203,6 +203,10 @@ async def chat_endpoint(request: ChatRequest):
     # Handle Errors from the agent
     if raw_result.get("error") or not raw_result.get("success", True):
         return ChatResponse(
+            sql_query=raw_result.get("cleaned_sql_query", ""),
+            data=[],  # Always return empty list on error
+            record_count=0,
+            chart_analysis={"chartable": False, "reasoning": "Error occurred"},
             error=raw_result.get("error", "Unknown error occurred processing query")
         )
 
@@ -210,17 +214,29 @@ async def chat_endpoint(request: ChatRequest):
     data_content = []
     execution_data_str = raw_result.get("execution_data_json", "[]")
     try:
-        data_content = json.loads(execution_data_str)
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse execution_data_json")
+        parsed = json.loads(execution_data_str)
+        # Ensure data_content is ALWAYS a list
+        if isinstance(parsed, list):
+            data_content = parsed
+        elif isinstance(parsed, dict):
+            # Handle error dict or single record
+            if "error" in parsed:
+                logger.warning(f"Query returned error: {parsed.get('error')}")
+                data_content = []
+            else:
+                data_content = [parsed]
+        else:
+            data_content = []
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse execution_data_json: {e}")
         data_content = []
 
     # Map raw result to Pydantic Response
     response = ChatResponse(
-        sql_query=raw_result.get("cleaned_sql_query"),
+        sql_query=raw_result.get("cleaned_sql_query", ""),
         data=data_content,
-        record_count=len(data_content) if isinstance(data_content, list) else 0,
-        chart_analysis=raw_result.get("chart_analysis")
+        record_count=len(data_content),
+        chart_analysis=raw_result.get("chart_analysis", {"chartable": False, "reasoning": "No analysis available"})
     )
     
     return response
